@@ -1,0 +1,61 @@
+import {test,before,after,beforeEach,afterEach} from 'node:test';
+import assert from 'node:assert/strict';
+import {JSDOM} from 'jsdom';
+import {build} from 'esbuild';
+import {mkdir,writeFile,rm} from 'node:fs/promises';
+import React,{act} from 'react';
+import {pathToFileURL} from 'node:url';
+let dom,root,App,createRoot,mapMock,markers,geoError,geoSuccess,routeResolver;
+const feature=(city='Noida',coords=[77.391,28.5355])=>({type:'Feature',geometry:{type:'Point',coordinates:coords},properties:{name:`${city} address`,city,countrycode:'IN',country:'India',osm_id:coords[0]}});
+let searchData,reverseData,routeData,fetchCalls;
+function mockLeaflet(){
+ markers=[];mapMock={listeners:{},setView(){return this;},on(name,fn){this.listeners[name]=fn;return this;},invalidateSize(){},remove(){},fitBounds(){}};
+ return {map:()=>mapMock,control:{zoom:()=>({addTo(){}})},tileLayer:()=>({addTo(){return this;},on(){return this;},redraw(){}}),divIcon:o=>o,latLngBounds:x=>x,marker:(coords,o)=>{const m={coords,options:o,listeners:{},removed:false,addTo(){markers.push(this);return this;},on(name,fn){this.listeners[name]=fn;return this;},getLatLng(){return{lat:this.coords[0],lng:this.coords[1]};},remove(){this.removed=true;}};return m;},polyline:()=>({addTo(){return this;},getBounds(){return[];},remove(){}})};
+}
+before(async()=>{
+ const boot=new JSDOM('<html><body></body></html>');global.window=boot.window;global.document=boot.window.document;({createRoot}=await import('react-dom/client'));boot.window.close();
+ await mkdir('.test-build',{recursive:true});
+ const result=await build({entryPoints:['src/App.jsx'],bundle:true,write:false,platform:'node',format:'esm',jsx:'automatic',external:['react','react-dom','lucide-react'],define:{'import.meta.env':'{}'},plugins:[{name:'demo-test-adapters',setup(b){b.onResolve({filter:/^leaflet$/},()=>({path:'leaflet',namespace:'mock'}));b.onLoad({filter:/.*/,namespace:'mock'},()=>({contents:'export default globalThis.__leafletMock;',loader:'js'}));b.onLoad({filter:/leaflet\.css$/},()=>({contents:'',loader:'js'}));b.onLoad({filter:/src\/lib\/http\.js$/},()=>({contents:'export function createJsonClient(){return async (url,{signal}={})=>{const r=await fetch(url,{signal});if(!r.ok)throw new Error("Map service returned HTTP "+r.status);return r.json();};}',loader:'js'}));}}]});
+ await writeFile('.test-build/app.mjs',result.outputFiles[0].text);App=(await import(pathToFileURL(`${process.cwd()}/.test-build/app.mjs`))).default;
+});
+after(async()=>{await rm('.test-build',{recursive:true,force:true});});
+beforeEach(()=>{
+ dom=new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>',{url:'https://cityride.test/'});
+ global.window=dom.window;global.document=dom.window.document;global.HTMLElement=dom.window.HTMLElement;global.CustomEvent=dom.window.CustomEvent;Object.defineProperty(global,'navigator',{value:dom.window.navigator,configurable:true});global.IS_REACT_ACT_ENVIRONMENT=true;
+ window.HTMLElement.prototype.scrollIntoView=function(){};window.HTMLDialogElement.prototype.showModal=function(){this.open=true;};window.HTMLDialogElement.prototype.close=function(){this.open=false;};
+ Object.defineProperty(window,'isSecureContext',{value:true});geoError={code:1};geoSuccess=null;
+ navigator.geolocation={getCurrentPosition:(ok,fail)=>geoError?fail(geoError):ok({coords:{latitude:28.5355,longitude:77.391}})};
+ global.__leafletMock=mockLeaflet();root=createRoot(document.getElementById('root'));
+ searchData=query=>query.toLowerCase().includes('delhi')?[feature('New Delhi',[77.209,28.6139])]:query.toLowerCase().includes('pune')?[feature('Pune',[73.85,18.52])]:[feature()];
+ reverseData=[feature()];routeData={code:'Ok',routes:[{distance:27761,duration:3300,geometry:{coordinates:[[77.391,28.5355],[77.209,28.6139]]}}]};fetchCalls=[];routeResolver=null;
+ global.fetch=async(url,options)=>{
+  fetchCalls.push(String(url));
+  if(String(url).includes('/route/')){if(routeResolver)return routeResolver(url,options);return{ok:true,json:async()=>routeData};}
+  const features=String(url).includes('/reverse')?reverseData:searchData(new URL(url).searchParams.get('q')||'');
+  return{ok:true,json:async()=>({features})};
+ };
+});
+afterEach(async()=>{await act(async()=>root.unmount());dom.window.close();delete global.window;delete global.document;});
+const wait=ms=>act(async()=>{await new Promise(r=>setTimeout(r,ms));});
+async function render(path='/'){window.history.replaceState({},'',path);await act(async()=>root.render(React.createElement(App,{key:path})));await wait(0);}
+const btn=text=>[...document.querySelectorAll('button')].find(b=>b.textContent.includes(text));
+async function click(el){assert.ok(el,'control exists');await act(async()=>el.click());await wait(0);}
+async function input(el,value){const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;await act(async()=>{setter.call(el,value);el.dispatchEvent(new window.Event('input',{bubbles:true}));});}
+async function choose(kind,query){await input(document.querySelector(`[aria-label="${kind} address search"]`),query);await wait(750);await click(document.querySelector(`[aria-label="${kind} address suggestions"] [role="option"]`));}
+async function endpoints(){await choose('pickup','Noida');await choose('drop','Delhi');}
+test('public page contains only calculator and no city pricing grid',async()=>{await render();assert.ok(document.querySelector('.planner'));assert.equal(document.querySelector('.cities-grid'),null);assert.equal(document.querySelector('.rates-table'),null);assert.equal(document.querySelectorAll('[role="combobox"]').length,2);assert.equal(btn('Use current location').disabled,false);});
+test('manual searches calculate actual road fare and show review summary',async()=>{await render();await endpoints();await click(btn('Calculate fare'));assert.match(document.querySelector('.fare-total').textContent,/444.18/);assert.match(document.querySelector('.fare-panel').textContent,/27.8/);assert.ok(fetchCalls.some(u=>u.includes('/route/v1/driving/77.391,28.5355;77.209,28.6139')));await click(btn('Review trip'));assert.ok(document.querySelector('dialog').open);await click(document.querySelector('[aria-label="Close trip summary"]'));assert.equal(document.querySelector('dialog'),null);});
+test('typing into a selected address keeps the new text and invalidates fare',async()=>{await render();await endpoints();await click(btn('Calculate fare'));const el=document.querySelector('[aria-label="pickup address search"]');await input(el,'Delhi');assert.equal(el.value,'Delhi');assert.equal(document.querySelector('.fare-panel'),null);});
+test('swap uses new pickup rate and reset clears both fields',async()=>{await render();await endpoints();await click(document.querySelector('[aria-label="Swap pickup and drop"]'));await click(btn('Calculate fare'));assert.match(document.querySelector('.fare-total').textContent,/499.70/);await click(document.querySelector('[aria-label="Reset trip"]'));assert.equal(document.querySelector('.fare-panel'),null);assert.equal(document.querySelector('[aria-label="pickup address search"]').value,'');assert.equal(document.querySelector('[aria-label="drop address search"]').value,'');});
+test('both locations can be selected on map and dragging invalidates old quote',async()=>{await render();await click(document.querySelectorAll('.field-label .text-button')[0]);await act(async()=>mapMock.listeners.click({latlng:{lat:28.5355,lng:77.391}}));reverseData=[feature('New Delhi',[77.209,28.6139])];await click(document.querySelectorAll('.field-label .text-button')[1]);await act(async()=>mapMock.listeners.click({latlng:{lat:28.6139,lng:77.209}}));await click(btn('Calculate fare'));assert.match(document.querySelector('.fare-total').textContent,/444.18/);const marker=markers.filter(m=>!m.removed)[0];assert.ok(marker.options.draggable);marker.coords=[28.60,77.21];await act(async()=>marker.listeners.dragend());assert.equal(document.querySelector('.fare-panel'),null);});
+test('current location permission denial leaves manual entry available',async()=>{await render();await click(btn('Use current location'));assert.match(document.querySelector('[role="alert"]').textContent,/denied/);assert.equal(document.querySelectorAll('[role="combobox"]').length,2);});
+test('current location autofills pickup after browser permission',async()=>{geoError=null;await render();await wait(700);assert.match(document.querySelector('[aria-label="pickup address search"]').value,/Noida/);assert.match(document.querySelector('.city-detected').textContent,/16/);});
+test('slow current location cannot overwrite manual pickup',async()=>{await render();let resolveGPS;navigator.geolocation.getCurrentPosition=ok=>{resolveGPS=ok;};await click(btn('Use current location'));await choose('pickup','Delhi');await act(async()=>resolveGPS({coords:{latitude:28.5355,longitude:77.391}}));assert.match(document.querySelector('[aria-label="pickup address search"]').value,/New Delhi/);});
+test('known unsupported pickup is blocked',async()=>{await render();await choose('pickup','Pune');assert.match(document.querySelector('.unsupported-message').textContent,/not supported/);assert.equal(btn('Calculate fare').disabled,true);});
+test('GPS coordinates remain usable if address lookup returns no result',async()=>{geoError=null;reverseData=[];await render();await click(btn('Use current location'));assert.match(document.querySelector('[aria-label="pickup address search"]').value,/Map point/);assert.ok(document.getElementById('pricing-city'));const sel=document.getElementById('pricing-city');await act(async()=>{sel.value='noida';sel.dispatchEvent(new window.Event('change',{bubbles:true}));});assert.match(document.querySelector('.city-detected').textContent,/Noida/);});
+test('no routing result produces an error instead of sample distance',async()=>{await render();await endpoints();routeData={code:'NoRoute',routes:[]};await click(btn('Calculate fare'));assert.match(document.querySelector('[role="alert"]').textContent,/No driving route/);assert.equal(document.querySelector('.fare-panel'),null);});
+test('late road response is ignored after changing a location',async()=>{await render();await endpoints();let resolve;routeResolver=()=>new Promise(r=>{resolve=r;});await click(btn('Calculate fare'));await input(document.querySelector('[aria-label="pickup address search"]'),'Changed');await act(async()=>resolve({ok:true,json:async()=>routeData}));assert.equal(document.querySelector('.fare-panel'),null);});
+test('admin saves rate edits and calculator uses them in same browser',async()=>{await render('/admin');assert.equal(document.querySelectorAll('.rates-table tbody tr').length,10);await input(document.querySelector('[aria-label="Noida rate per km"]'),'20');await click(btn('Save changes'));assert.match(document.querySelector('[role="status"]').textContent,/saved/);await render('/');await endpoints();await click(btn('Calculate fare'));assert.match(document.querySelector('.fare-total').textContent,/555.22/);});
+test('admin invalid rate is rejected without writing browser storage',async()=>{await render('/admin');await input(document.querySelector('[aria-label="Delhi rate per km"]'),'0');await click(btn('Save changes'));assert.match(document.querySelector('[role="alert"]').textContent,/valid rate/);assert.equal(window.localStorage.getItem('cityride.rates.v2'),null);});
+test('admin can disable a pickup city and the calculator respects it',async()=>{await render('/admin');await click(document.querySelector('[aria-label="Noida pickup service"]'));await click(btn('Save changes'));await render('/');await choose('pickup','Noida');assert.match(document.querySelector('.unsupported-message').textContent,/disabled/);assert.equal(btn('Calculate fare').disabled,true);});
+test('admin search filters city table and restore defaults resets edited prices',async()=>{await render('/admin');await input(document.querySelector('[aria-label="Search admin cities"]'),'Noida');assert.equal(document.querySelectorAll('.rates-table tbody tr').length,2);await input(document.querySelector('[aria-label="Noida rate per km"]'),'29');await click(btn('Restore defaults'));assert.equal(document.querySelector('[aria-label="Noida rate per km"]').value,'16');});
